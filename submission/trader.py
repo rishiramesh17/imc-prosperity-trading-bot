@@ -8,19 +8,22 @@ from datamodel import Order, OrderDepth, TradingState
 LIMITS = {"EMERALDS": 80, "TOMATOES": 80}
 
 EMERALDS_FAIR_VALUE = 10000.0
-EMERALDS_QUOTE_EDGE = 3.0
-EMERALDS_TAKE_EDGE = 1.0
-EMERALDS_POSITION_SKEW = 0.10
-EMERALDS_PASSIVE_SIZE = 20
+EMERALDS_QUOTE_EDGE = 1.5
+EMERALDS_TAKE_EDGE = 0.0
+EMERALDS_POSITION_SKEW = 0.08
+EMERALDS_PASSIVE_SIZE = 28
 
-TOMATO_ALPHA = 0.35
-TOMATO_QUOTE_EDGE = 2.0
+TOMATO_ALPHA = 0.45
+TOMATO_QUOTE_EDGE = 1.5
 TOMATO_TAKE_EDGE = 1.0
 TOMATO_POSITION_SKEW = 0.12
-TOMATO_PASSIVE_SIZE = 12
+TOMATO_PASSIVE_SIZE = 16
 
-SOFT_POSITION_LIMIT = 50
-HARD_POSITION_LIMIT = 65
+SOFT_POSITION_LIMIT = 60
+HARD_POSITION_LIMIT = 72
+CLEARING_THRESHOLD = 30
+RISK_OFF_TIMESTAMP = 980000
+FINAL_FLATTEN_TIMESTAMP = 995000
 
 
 class Trader:
@@ -59,10 +62,11 @@ class Trader:
             remaining_buy = LIMITS[product] - position
             remaining_sell = LIMITS[product] + position
 
+            taking_fair = fair_value - position_skew * position
             take_orders, remaining_buy, remaining_sell, expected_position = self._take_stale_quotes(
                 product=product,
                 depth=depth,
-                fair_value=fair_value,
+                fair_value=taking_fair,
                 take_edge=take_edge,
                 position=position,
                 remaining_buy=remaining_buy,
@@ -75,6 +79,8 @@ class Trader:
                 position=expected_position,
                 best_bid=best_bid,
                 best_ask=best_ask,
+                fair_value=fair_value,
+                timestamp=state.timestamp,
                 remaining_buy=remaining_buy,
                 remaining_sell=remaining_sell,
             )
@@ -91,10 +97,28 @@ class Trader:
             passive_buy_size = min(passive_size, max(0, remaining_buy))
             passive_sell_size = min(passive_size, max(0, remaining_sell))
 
-            if position > SOFT_POSITION_LIMIT:
+            if abs(expected_position) <= 10 and state.timestamp < RISK_OFF_TIMESTAMP:
+                passive_buy_size = min(max(passive_size, remaining_buy // 2), max(0, remaining_buy))
+                passive_sell_size = min(max(passive_size, remaining_sell // 2), max(0, remaining_sell))
+
+            inventory_ratio = expected_position / LIMITS[product]
+            buy_scale = max(0.0, 1.0 - max(0.0, inventory_ratio) * 2.0)
+            sell_scale = max(0.0, 1.0 - max(0.0, -inventory_ratio) * 2.0)
+            passive_buy_size = int(passive_buy_size * buy_scale)
+            passive_sell_size = int(passive_sell_size * sell_scale)
+
+            if expected_position > SOFT_POSITION_LIMIT:
                 passive_buy_size = 0
-            elif position < -SOFT_POSITION_LIMIT:
+            elif expected_position < -SOFT_POSITION_LIMIT:
                 passive_sell_size = 0
+
+            if state.timestamp >= RISK_OFF_TIMESTAMP:
+                if expected_position > 0:
+                    passive_buy_size = 0
+                    passive_sell_size = max(passive_sell_size, min(passive_size, remaining_sell))
+                elif expected_position < 0:
+                    passive_sell_size = 0
+                    passive_buy_size = max(passive_buy_size, min(passive_size, remaining_buy))
 
             if passive_buy_size > 0:
                 orders.append(Order(product, bid_quote, passive_buy_size))
@@ -111,8 +135,11 @@ class Trader:
         wall_mid = self._wall_mid(depth)
         microprice = self._microprice(depth)
         mid = (best_bid + best_ask) / 2.0
+        bid_volume = depth.buy_orders[best_bid]
+        ask_volume = abs(depth.sell_orders[best_ask])
+        oib = (bid_volume - ask_volume) / (bid_volume + ask_volume)
 
-        raw_signal = mid + 0.8 * (wall_mid - mid) + 0.9 * (microprice - mid)
+        raw_signal = mid + 0.7 * (wall_mid - mid) + 0.8 * (microprice - mid) + 0.75 * oib
         previous = data.get("tomatoes_ema")
         fair_value = raw_signal if previous is None else TOMATO_ALPHA * raw_signal + (1.0 - TOMATO_ALPHA) * previous
         data["tomatoes_ema"] = fair_value
@@ -163,6 +190,8 @@ class Trader:
         position: int,
         best_bid: int,
         best_ask: int,
+        fair_value: float,
+        timestamp: int,
         remaining_buy: int,
         remaining_sell: int,
     ) -> Tuple[List[Order], int, int, int]:
@@ -178,6 +207,43 @@ class Trader:
         elif position < -HARD_POSITION_LIMIT and remaining_buy > 0:
             quantity = min((-position) - SOFT_POSITION_LIMIT, remaining_buy)
             if quantity > 0:
+                orders.append(Order(product, best_ask, quantity))
+                remaining_buy -= quantity
+                expected_position += quantity
+
+        if position > CLEARING_THRESHOLD and remaining_sell > 0:
+            clear_price = max(best_bid, int(round(fair_value)))
+            quantity = min(max(1, position - CLEARING_THRESHOLD), remaining_sell)
+            orders.append(Order(product, clear_price, -quantity))
+            remaining_sell -= quantity
+            expected_position -= quantity
+        elif position < -CLEARING_THRESHOLD and remaining_buy > 0:
+            clear_price = min(best_ask, int(round(fair_value)))
+            quantity = min(max(1, (-position) - CLEARING_THRESHOLD), remaining_buy)
+            orders.append(Order(product, clear_price, quantity))
+            remaining_buy -= quantity
+            expected_position += quantity
+
+        if timestamp >= RISK_OFF_TIMESTAMP:
+            if position > 0 and remaining_sell > 0:
+                quantity = min(position, remaining_sell)
+                orders.append(Order(product, best_bid, -quantity))
+                remaining_sell -= quantity
+                expected_position -= quantity
+            elif position < 0 and remaining_buy > 0:
+                quantity = min(-position, remaining_buy)
+                orders.append(Order(product, best_ask, quantity))
+                remaining_buy -= quantity
+                expected_position += quantity
+
+        if timestamp >= FINAL_FLATTEN_TIMESTAMP:
+            if expected_position > 0 and remaining_sell > 0:
+                quantity = min(expected_position, remaining_sell)
+                orders.append(Order(product, best_bid, -quantity))
+                remaining_sell -= quantity
+                expected_position -= quantity
+            elif expected_position < 0 and remaining_buy > 0:
+                quantity = min(-expected_position, remaining_buy)
                 orders.append(Order(product, best_ask, quantity))
                 remaining_buy -= quantity
                 expected_position += quantity
